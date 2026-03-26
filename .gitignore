@@ -21,12 +21,16 @@ backend/**/*.suo
 **/kubeconfig
 **/service-account.json
 
-# ── Infrastructure outputs ────────────────────────────────────────────────────
-infrastructure/**/.terraform/
-infrastructure/**/terraform.tfstate
-infrastructure/**/terraform.tfstate.backup
-infrastructure/**/*.tfvars
-!infrastructure/**/prod.parameters.json   # allowed — no secrets inside
+# ── Terraform ────────────────────────────────────────────────────────────────
+**/.terraform/
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/terraform.tfstate.*.backup
+**/.terraform.tfstate.lock.info
+**/*.tfvars
+**/*.tfvars.json
+terraform/.backend-config
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 .docker/
@@ -67,5 +71,3 @@ dotnet-vuln.txt
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
-terraform/.backend-config
-terraform/.terraform
