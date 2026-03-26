@@ -68,3 +68,4 @@ dotnet-vuln.txt
 *.log
 logs/
 terraform/.backend-config
+terraform/.terraform
