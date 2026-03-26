@@ -1,0 +1,354 @@
+name: Backend CI — Build, Scan & Publish to Nexus
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-ci.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'backend/**'
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  IMAGE_NAME: ecommerce-backend
+  PROJECT_PATH: backend/src/ECommerceAPI/ECommerceAPI.csproj
+  TEST_PROJECT_PATH: backend/tests/ECommerceAPI.Tests/ECommerceAPI.Tests.csproj
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Secret Scanning (Gitleaks)
+  # ─────────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format sarif \
+            --report-path gitleaks-report.sarif \
+            --exit-code 1
+
+      - name: Upload Gitleaks SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif-backend
+          path: gitleaks-report.sarif
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Build & Unit Tests
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-test:
+    name: .NET Build & Unit Tests
+    runs-on: self-hosted
+    needs: secret-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.PROJECT_PATH }}
+
+      - name: Check for vulnerable NuGet packages (SCA)
+        run: |
+          dotnet list ${{ env.PROJECT_PATH }} package --vulnerable --include-transitive 2>&1 | tee dotnet-vuln-report.txt
+          # Fail if any critical CVEs found
+          if grep -q "Critical" dotnet-vuln-report.txt; then
+            echo "Critical vulnerabilities found in NuGet packages!"
+            exit 1
+          fi
+
+      - name: Build solution
+        run: |
+          dotnet build ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --no-restore \
+            /p:TreatWarningsAsErrors=false
+
+      - name: Run unit tests with coverage
+        run: |
+          dotnet test ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --no-build \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults \
+            --logger "trx;LogFileName=test-results.trx" \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover \
+            || true
+
+      - name: Publish build artifact
+        run: |
+          dotnet publish ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --no-build \
+            --output ./publish
+
+      - name: Upload publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-publish
+          path: publish/
+          retention-days: 7
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: |
+            TestResults/
+            dotnet-vuln-report.txt
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: SonarQube SAST
+  # ─────────────────────────────────────────────────────────────────────────────
+  sonarqube:
+    name: SonarQube SAST Analysis
+    runs-on: self-hosted
+    needs: build-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install SonarQube scanner for .NET
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.PROJECT_PATH }}
+
+      - name: Begin SonarQube analysis
+        run: |
+          dotnet sonarscanner begin \
+            /k:"ecommerce-backend" \
+            /n:"ECommerce Backend" \
+            /v:"${{ github.sha }}" \
+            /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            /d:sonar.token="${{ secrets.SONAR_TOKEN }}" \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
+            /d:sonar.cs.vstest.reportsPaths="**/test-results.trx" \
+            /d:sonar.qualitygate.wait=true
+
+      - name: Build for SonarQube
+        run: dotnet build ${{ env.PROJECT_PATH }} --configuration Release --no-restore
+
+      - name: Run tests for coverage
+        run: |
+          dotnet test ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --no-build \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults \
+            --logger "trx;LogFileName=test-results.trx" \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover \
+            || true
+
+      - name: End SonarQube analysis
+        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4: OWASP Dependency-Check
+  # ─────────────────────────────────────────────────────────────────────────────
+  owasp-dependency-check:
+    name: OWASP Dependency-Check
+    runs-on: self-hosted
+    needs: build-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run OWASP Dependency-Check
+        run: |
+          /opt/dependency-check/bin/dependency-check.sh \
+            --project "ecommerce-backend" \
+            --scan backend/ \
+            --format HTML \
+            --format JSON \
+            --out dependency-check-reports/ \
+            --failOnCVSS 8 \
+            --enableRetired
+
+      - name: Upload Dependency-Check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-dependency-check-backend
+          path: dependency-check-reports/
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 5: Docker Build & Trivy Container Scan
+  # ─────────────────────────────────────────────────────────────────────────────
+  docker-build-scan:
+    name: Docker Build & Trivy Container Scan
+    runs-on: self-hosted
+    needs: [sonarqube, owasp-dependency-check]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tags
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_tag=${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_latest=${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ steps.tags.outputs.image_tag }} \
+            --tag ${{ steps.tags.outputs.image_latest }} \
+            --label "build.sha=${{ github.sha }}" \
+            --label "build.ref=${{ github.ref }}" \
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --file backend/Dockerfile \
+            backend/
+
+      - name: Run Trivy filesystem scan
+        run: |
+          trivy fs \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output trivy-fs-backend.sarif \
+            backend/
+
+      - name: Run Trivy image scan
+        run: |
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-image-backend.sarif \
+            ${{ steps.tags.outputs.image_tag }}
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-backend-reports
+          path: |
+            trivy-fs-backend.sarif
+            trivy-image-backend.sarif
+
+      - name: Login to ACR
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: |
+          docker login \
+            "${{ secrets.ACR_LOGIN_SERVER }}" \
+            --username "${{ secrets.ACR_USERNAME }}" \
+            --password "${{ secrets.ACR_PASSWORD }}"
+
+      - name: Push image to ACR
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: |
+          docker push ${{ steps.tags.outputs.image_tag }}
+          docker push ${{ steps.tags.outputs.image_latest }}
+
+      - name: Export image metadata
+        run: |
+          echo "IMAGE_TAG=${{ steps.tags.outputs.image_tag }}" >> image-metadata.env
+          echo "SHORT_SHA=${{ steps.tags.outputs.short_sha }}" >> image-metadata.env
+
+      - name: Upload image metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-metadata
+          path: image-metadata.env
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 6: Publish Artifact to Nexus
+  # ─────────────────────────────────────────────────────────────────────────────
+  publish-nexus:
+    name: Publish Build Artifact to Nexus
+    runs-on: self-hosted
+    needs: docker-build-scan
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download publish artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-publish
+          path: publish/
+
+      - name: Package artifact
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          VERSION="1.0.0-${SHORT_SHA}"
+          tar -czf "ecommerce-backend-${VERSION}.tar.gz" -C publish .
+          echo "ARTIFACT_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "ARTIFACT_FILE=ecommerce-backend-${VERSION}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload .NET build to Nexus Raw Repository
+        run: |
+          curl --fail --silent --show-error \
+            --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            --upload-file "${{ env.ARTIFACT_FILE }}" \
+            "${{ secrets.NEXUS_URL }}/repository/ecommerce-releases/backend/${{ env.ARTIFACT_VERSION }}/${{ env.ARTIFACT_FILE }}"
+
+      - name: Upload Docker image digest to Nexus
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          docker inspect "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}" \
+            --format '{{json .}}' > docker-manifest.json
+          curl --fail --silent --show-error \
+            --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            --upload-file docker-manifest.json \
+            "${{ secrets.NEXUS_URL }}/repository/ecommerce-releases/backend/${{ env.ARTIFACT_VERSION }}/docker-manifest.json"
+
+      - name: Notify Slack — Build Success
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            --data '{
+              "text": "✅ *Backend CI Passed* — `${{ github.ref_name }}` @ `'"$(echo ${{ github.sha }} | cut -c1-8)"'`\nArtifact: `${{ env.ARTIFACT_FILE }}` published to Nexus"
+            }'
+
+      - name: Notify Slack — Build Failure
+        if: failure()
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            --data '{
+              "text": "❌ *Backend CI FAILED* — `${{ github.ref_name }}` @ `'"$(echo ${{ github.sha }} | cut -c1-8)"'`\nCheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'

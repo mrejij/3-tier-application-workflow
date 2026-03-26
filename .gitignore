@@ -1,0 +1,70 @@
+# ── Frontend ──────────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/
+frontend/coverage/
+
+# ── Backend ───────────────────────────────────────────────────────────────────
+backend/**/bin/
+backend/**/obj/
+backend/**/TestResults/
+backend/**/*.user
+backend/**/*.suo
+
+# ── Secrets / credentials (never commit these) ────────────────────────────────
+**/*.env
+**/*.env.local
+**/appsettings.Development.json
+**/appsettings.Production.json
+**/*secrets*.json
+**/*credentials*.json
+**/kubeconfig
+**/service-account.json
+
+# ── Infrastructure outputs ────────────────────────────────────────────────────
+infrastructure/**/.terraform/
+infrastructure/**/terraform.tfstate
+infrastructure/**/terraform.tfstate.backup
+infrastructure/**/*.tfvars
+!infrastructure/**/prod.parameters.json   # allowed — no secrets inside
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.docker/
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+ehthumbs.db
+Desktop.ini
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
+publish/
+*.tar.gz
+*.zip
+*.nupkg
+*.snupkg
+
+# ── Security scan outputs (generated, not source) ─────────────────────────────
+gitleaks-report*.sarif
+gitleaks-report*.json
+trivy-*.sarif
+trivy-*.json
+dependency-check-reports/
+checkov-*.json
+checkov-*.sarif
+zap-reports/
+npm-audit.json
+dotnet-vuln.txt
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+terraform/.backend-config

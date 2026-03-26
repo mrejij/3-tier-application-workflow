@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "eastus"
+    },
+    "environment": {
+      "value": "prod"
+    },
+    "projectName": {
+      "value": "shopmart"
+    },
+    "sqlAdminLogin": {
+      "value": "sqladmin"
+    },
+    "sqlAdminPassword": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/REPLACE_SUBSCRIPTION_ID/resourceGroups/rg-shopmart-prod/providers/Microsoft.KeyVault/vaults/kv-shopmart-bootstrap"
+        },
+        "secretName": "SqlAdminPassword"
+      }
+    },
+    "aksNodeCount": {
+      "value": 2
+    },
+    "aksNodeVmSize": {
+      "value": "Standard_D4s_v5"
+    }
+  }
+}

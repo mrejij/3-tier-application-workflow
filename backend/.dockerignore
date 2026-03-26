@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+
+# User secrets
+**/appsettings.Development.json
+**/appsettings.Production.json
+
+# Visual Studio
+.vs/
+*.user
+
+# Test results
+TestResults/
+coverage/

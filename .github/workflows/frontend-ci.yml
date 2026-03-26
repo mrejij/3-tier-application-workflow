@@ -1,0 +1,310 @@
+name: Frontend CI — Build, Scan & Publish to Nexus
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-ci.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+
+env:
+  NODE_VERSION: '20'
+  IMAGE_NAME: ecommerce-frontend
+  NEXUS_REPO: ecommerce-npm
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Secret Scanning (Gitleaks)
+  # ─────────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format sarif \
+            --report-path gitleaks-report.sarif \
+            --exit-code 1
+        continue-on-error: false
+
+      - name: Upload Gitleaks SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks-report.sarif
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Build, Test & SCA
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-test:
+    name: Build, Test & Dependency Audit
+    runs-on: self-hosted
+    needs: secret-scan
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Run npm audit (SCA)
+        run: |
+          npm audit --audit-level=high --json > npm-audit-report.json || true
+          # Fail on critical vulnerabilities
+          npm audit --audit-level=critical
+
+      - name: Run ESLint with security plugin
+        run: npm run lint:security || true
+
+      - name: Run unit tests with coverage
+        run: npm run test
+
+      - name: Build production artifact
+        run: npm run build:prod
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 7
+
+      - name: Upload npm audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: frontend/npm-audit-report.json
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: SonarQube SAST
+  # ─────────────────────────────────────────────────────────────────────────────
+  sonarqube:
+    name: SonarQube SAST Analysis
+    runs-on: self-hosted
+    needs: build-test
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Run tests with coverage for SonarQube
+        run: npm run test
+
+      - name: SonarQube Scan
+        run: |
+          sonar-scanner \
+            -Dsonar.projectKey=ecommerce-frontend \
+            -Dsonar.projectName="ECommerce Frontend" \
+            -Dsonar.projectVersion=${{ github.sha }} \
+            -Dsonar.sources=src \
+            -Dsonar.exclusions="**/node_modules/**,**/*.spec.ts,**/dist/**" \
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=300
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4: OWASP Dependency-Check
+  # ─────────────────────────────────────────────────────────────────────────────
+  owasp-dependency-check:
+    name: OWASP Dependency-Check
+    runs-on: self-hosted
+    needs: build-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run OWASP Dependency-Check
+        run: |
+          /opt/dependency-check/bin/dependency-check.sh \
+            --project "ecommerce-frontend" \
+            --scan frontend/ \
+            --format HTML \
+            --format JSON \
+            --out dependency-check-reports/ \
+            --failOnCVSS 8 \
+            --enableRetired
+
+      - name: Upload Dependency-Check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-dependency-check-frontend
+          path: dependency-check-reports/
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 5: Docker Build & Container Scan (Trivy)
+  # ─────────────────────────────────────────────────────────────────────────────
+  docker-build-scan:
+    name: Docker Build & Trivy Container Scan
+    runs-on: self-hosted
+    needs: [sonarqube, owasp-dependency-check]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tags
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_tag=${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_latest=${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ steps.tags.outputs.image_tag }} \
+            --tag ${{ steps.tags.outputs.image_latest }} \
+            --label "build.sha=${{ github.sha }}" \
+            --label "build.ref=${{ github.ref }}" \
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --file frontend/Dockerfile \
+            frontend/
+
+      - name: Run Trivy filesystem scan
+        run: |
+          trivy fs \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output trivy-fs-report.sarif \
+            frontend/
+
+      - name: Run Trivy image scan
+        run: |
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-image-report.sarif \
+            ${{ steps.tags.outputs.image_tag }}
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-frontend-reports
+          path: |
+            trivy-fs-report.sarif
+            trivy-image-report.sarif
+
+      - name: Login to ACR
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: |
+          docker login \
+            "${{ secrets.ACR_LOGIN_SERVER }}" \
+            --username "${{ secrets.ACR_USERNAME }}" \
+            --password "${{ secrets.ACR_PASSWORD }}"
+
+      - name: Push image to ACR
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: |
+          docker push ${{ steps.tags.outputs.image_tag }}
+          docker push ${{ steps.tags.outputs.image_latest }}
+
+      - name: Export image metadata
+        run: |
+          echo "IMAGE_TAG=${{ steps.tags.outputs.image_tag }}" >> image-metadata.env
+          echo "SHORT_SHA=${{ steps.tags.outputs.short_sha }}" >> image-metadata.env
+
+      - name: Upload image metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-image-metadata
+          path: image-metadata.env
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 6: Publish Artifact to Nexus
+  # ─────────────────────────────────────────────────────────────────────────────
+  publish-nexus:
+    name: Publish Build Artifact to Nexus
+    runs-on: self-hosted
+    needs: docker-build-scan
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+
+      - name: Package artifact
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          VERSION="1.0.0-${SHORT_SHA}"
+          tar -czf "ecommerce-frontend-${VERSION}.tar.gz" -C dist .
+          echo "ARTIFACT_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "ARTIFACT_FILE=ecommerce-frontend-${VERSION}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload to Nexus Raw Repository
+        run: |
+          curl --fail --silent --show-error \
+            --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            --upload-file "${{ env.ARTIFACT_FILE }}" \
+            "${{ secrets.NEXUS_URL }}/repository/ecommerce-releases/frontend/${{ env.ARTIFACT_VERSION }}/${{ env.ARTIFACT_FILE }}"
+
+      - name: Notify Slack — Build Success
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            --data '{
+              "text": "✅ *Frontend CI Passed* — `${{ github.ref_name }}` @ `'"$(echo ${{ github.sha }} | cut -c1-8)"'`\nArtifact: `${{ env.ARTIFACT_FILE }}` published to Nexus"
+            }'
+
+      - name: Notify Slack — Build Failure
+        if: failure()
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            --data '{
+              "text": "❌ *Frontend CI FAILED* — `${{ github.ref_name }}` @ `'"$(echo ${{ github.sha }} | cut -c1-8)"'`\nCheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'

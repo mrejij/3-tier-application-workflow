@@ -1,0 +1,506 @@
+name: DevSecOps — Scheduled Security Scans
+
+on:
+  # Run nightly at 02:00 UTC
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Also run on any push to main that touches security config files
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/security-scan.yml'
+      - 'k8s/**'
+      - 'infrastructure/**'
+      - '.gitleaks.toml'
+
+  # Manual trigger for on-demand security assessment
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Scan type to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - secrets
+          - sast
+          - sca
+          - container
+          - iac
+          - dast
+
+env:
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 1. Secret Scanning — full repo scan
+  # ─────────────────────────────────────────────────────────────────────────────
+  secret-scanning:
+    name: Full Repository Secret Scan (Gitleaks)
+    runs-on: self-hosted
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'secrets'
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks — full history scan
+        id: gitleaks
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path gitleaks-full-report.json \
+            --exit-code 0  # don't fail — we'll check below
+
+          LEAK_COUNT=$(cat gitleaks-full-report.json | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)" \
+            2>/dev/null || echo "0")
+          echo "leak_count=${LEAK_COUNT}" >> $GITHUB_OUTPUT
+          echo "Found ${LEAK_COUNT} potential secrets"
+
+      - name: Alert if secrets found
+        if: steps.gitleaks.outputs.leak_count != '0'
+        run: |
+          curl -X POST "${{ env.SLACK_WEBHOOK }}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🔑 *Secret Scanning Alert* — Gitleaks found \`${{ steps.gitleaks.outputs.leak_count }}\` potential secrets in repository!\nBranch: \`${{ github.ref_name }}\`\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n⚠️ *Immediate action required — rotate any exposed credentials!*\"
+            }"
+          exit 1
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-full-report
+          path: gitleaks-full-report.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 2. SAST — SonarQube Quality Gate re-check
+  # ─────────────────────────────────────────────────────────────────────────────
+  sast-sonarqube:
+    name: SAST — SonarQube Full Scan
+    runs-on: self-hosted
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'sast'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install SonarQube .NET scanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Scan Backend (ASP.NET)
+        run: |
+          dotnet sonarscanner begin \
+            /k:"ecommerce-backend" \
+            /n:"ECommerce Backend — Scheduled" \
+            /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            /d:sonar.token="${{ secrets.SONAR_TOKEN }}" \
+            /d:sonar.qualitygate.wait=true
+          dotnet build backend/src/ECommerceAPI/ECommerceAPI.csproj -c Release --no-restore 2>/dev/null || true
+          dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+      - name: Scan Frontend (Angular)
+        run: |
+          cd frontend
+          npm ci --no-audit --silent
+          sonar-scanner \
+            -Dsonar.projectKey=ecommerce-frontend \
+            -Dsonar.projectName="ECommerce Frontend — Scheduled" \
+            -Dsonar.sources=src \
+            -Dsonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            -Dsonar.token="${{ secrets.SONAR_TOKEN }}" \
+            -Dsonar.qualitygate.wait=true || true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 3. SCA — Dependency vulnerability scan (both frontend & backend)
+  # ─────────────────────────────────────────────────────────────────────────────
+  sca-scan:
+    name: SCA — Dependency Vulnerability Scan
+    runs-on: self-hosted
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'sca'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js & .NET
+        run: |
+          node --version
+          dotnet --version
+
+      - name: npm audit — Frontend
+        id: npm_audit
+        run: |
+          cd frontend
+          npm ci --no-audit --silent
+          AUDIT_OUTPUT=$(npm audit --audit-level=moderate --json 2>&1 || true)
+          echo "${AUDIT_OUTPUT}" > ../npm-audit.json
+          VULN_COUNT=$(echo "${AUDIT_OUTPUT}" | python3 -c \
+            "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('metadata',{}).get('vulnerabilities',{}).get('total',0))" \
+            2>/dev/null || echo "0")
+          echo "npm_vuln_count=${VULN_COUNT}" >> $GITHUB_OUTPUT
+
+      - name: dotnet list vulnerable — Backend
+        id: dotnet_vuln
+        run: |
+          dotnet list backend/src/ECommerceAPI/ECommerceAPI.csproj package \
+            --vulnerable --include-transitive 2>&1 | tee dotnet-vuln.txt
+          CRITICAL=$(grep -c "Critical" dotnet-vuln.txt 2>/dev/null || echo "0")
+          HIGH=$(grep -c "High" dotnet-vuln.txt 2>/dev/null || echo "0")
+          echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
+          echo "high=${HIGH}" >> $GITHUB_OUTPUT
+
+      - name: OWASP Dependency-Check — Full Scan
+        run: |
+          /opt/dependency-check/bin/dependency-check.sh \
+            --project "ecommerce-full" \
+            --scan . \
+            --exclude "**/node_modules/**" \
+            --exclude "**/dist/**" \
+            --exclude "**/.git/**" \
+            --format HTML \
+            --format JSON \
+            --format XML \
+            --out dependency-check-reports/ \
+            --nvdApiKey "${{ secrets.NVD_API_KEY }}" \
+            --failOnCVSS 9 \
+            --enableRetired
+
+      - name: Alert if critical vulnerabilities found
+        if: >
+          steps.dotnet_vuln.outputs.critical != '0' ||
+          steps.npm_audit.outputs.npm_vuln_count != '0'
+        run: |
+          curl -X POST "${{ env.SLACK_WEBHOOK }}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"⚠️ *SCA Alert — Vulnerable Dependencies Detected*\n• npm vulnerabilities (frontend): \`${{ steps.npm_audit.outputs.npm_vuln_count }}\`\n• NuGet critical (backend): \`${{ steps.dotnet_vuln.outputs.critical }}\`\n• NuGet high (backend): \`${{ steps.dotnet_vuln.outputs.high }}\`\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: |
+            npm-audit.json
+            dotnet-vuln.txt
+            dependency-check-reports/
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 4. Container Image Scanning — Trivy on all images in ACR
+  # ─────────────────────────────────────────────────────────────────────────────
+  container-scan:
+    name: Container Image Scan (Trivy)
+    runs-on: self-hosted
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'container'
+
+    steps:
+      - name: Login to ACR
+        run: |
+          docker login \
+            "${{ secrets.ACR_LOGIN_SERVER }}" \
+            --username "${{ secrets.ACR_USERNAME }}" \
+            --password "${{ secrets.ACR_PASSWORD }}"
+
+      - name: Pull latest images
+        run: |
+          docker pull "${{ secrets.ACR_LOGIN_SERVER }}/ecommerce-frontend:latest"
+          docker pull "${{ secrets.ACR_LOGIN_SERVER }}/ecommerce-backend:latest"
+
+      - name: Trivy scan — Frontend
+        id: trivy_frontend
+        run: |
+          trivy image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-frontend.json \
+            "${{ secrets.ACR_LOGIN_SERVER }}/ecommerce-frontend:latest"
+
+          CRITICAL=$(cat trivy-frontend.json | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); \
+            results=d.get('Results',[]);  \
+            total=sum(len([v for v in r.get('Vulnerabilities',[]) if v.get('Severity')=='CRITICAL']) for r in results); \
+            print(total)" 2>/dev/null || echo "0")
+          echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
+
+      - name: Trivy scan — Backend
+        id: trivy_backend
+        run: |
+          trivy image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-backend.json \
+            "${{ secrets.ACR_LOGIN_SERVER }}/ecommerce-backend:latest"
+
+          CRITICAL=$(cat trivy-backend.json | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); \
+            results=d.get('Results',[]);  \
+            total=sum(len([v for v in r.get('Vulnerabilities',[]) if v.get('Severity')=='CRITICAL']) for r in results); \
+            print(total)" 2>/dev/null || echo "0")
+          echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
+
+      - name: Alert on critical CVEs
+        if: >
+          steps.trivy_frontend.outputs.critical != '0' ||
+          steps.trivy_backend.outputs.critical != '0'
+        run: |
+          curl -X POST "${{ env.SLACK_WEBHOOK }}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🐋 *Container Image Security Alert*\n• Frontend CRITICAL CVEs: \`${{ steps.trivy_frontend.outputs.critical }}\`\n• Backend CRITICAL CVEs: \`${{ steps.trivy_backend.outputs.critical }}\`\n⚠️ Rebuild images with patched base images!\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }"
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scheduled-reports
+          path: |
+            trivy-frontend.json
+            trivy-backend.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 5. IaC Security Scan (Checkov)
+  # ─────────────────────────────────────────────────────────────────────────────
+  iac-security:
+    name: IaC Security Scan (Checkov)
+    runs-on: self-hosted
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'iac'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkov — Kubernetes manifests
+        id: checkov_k8s
+        run: |
+          checkov -d k8s/ \
+            --framework kubernetes \
+            --output json \
+            --output-file checkov-k8s.json \
+            --compact \
+            --quiet \
+            --soft-fail || true
+
+          FAILED=$(cat checkov-k8s.json | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); \
+            print(d.get('summary',{}).get('failed',0))" 2>/dev/null || echo "0")
+          echo "k8s_failed=${FAILED}" >> $GITHUB_OUTPUT
+
+      - name: Checkov — Bicep / ARM templates
+        id: checkov_bicep
+        run: |
+          checkov -d infrastructure/ \
+            --framework bicep \
+            --output json \
+            --output-file checkov-bicep.json \
+            --compact \
+            --quiet \
+            --soft-fail || true
+
+          FAILED=$(cat checkov-bicep.json | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); \
+            print(d.get('summary',{}).get('failed',0))" 2>/dev/null || echo "0")
+          echo "bicep_failed=${FAILED}" >> $GITHUB_OUTPUT
+
+      - name: Checkov — Dockerfiles
+        run: |
+          checkov -d . \
+            --framework dockerfile \
+            --output json \
+            --output-file checkov-dockerfiles.json \
+            --compact \
+            --quiet \
+            --soft-fail || true
+
+      - name: Alert on IaC security issues
+        if: >
+          steps.checkov_k8s.outputs.k8s_failed != '0' ||
+          steps.checkov_bicep.outputs.bicep_failed != '0'
+        run: |
+          curl -X POST "${{ env.SLACK_WEBHOOK }}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🏗️ *IaC Security Alert (Checkov)*\n• Kubernetes: \`${{ steps.checkov_k8s.outputs.k8s_failed }}\` checks failed\n• Bicep: \`${{ steps.checkov_bicep.outputs.bicep_failed }}\` checks failed\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }"
+
+      - name: Upload Checkov reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-scheduled-reports
+          path: |
+            checkov-k8s.json
+            checkov-bicep.json
+            checkov-dockerfiles.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 6. DAST — Scheduled OWASP ZAP Full Scan against production
+  # ─────────────────────────────────────────────────────────────────────────────
+  dast-production:
+    name: DAST — OWASP ZAP Full Scan (Production)
+    runs-on: self-hosted
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'dast'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create ZAP reports directory
+        run: mkdir -p zap-reports
+
+      - name: OWASP ZAP Full Scan (UI)
+        run: |
+          docker run --rm \
+            -v "$(pwd)/zap-reports:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t "https://shopmart.yourdomain.com" \
+            -r zap-full-frontend.html \
+            -J zap-full-frontend.json \
+            -x zap-full-frontend.xml \
+            -m 10 \
+            -I || true
+
+      - name: OWASP ZAP API Scan (REST API)
+        run: |
+          docker run --rm \
+            -v "$(pwd)/zap-reports:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py \
+            -t "https://api.shopmart.yourdomain.com/swagger/v1/swagger.json" \
+            -f openapi \
+            -r zap-api-full.html \
+            -J zap-api-full.json \
+            -I || true
+
+      - name: Analyse ZAP results
+        id: zap_analysis
+        run: |
+          FRONTEND_HIGH=$(cat zap-reports/zap-full-frontend.json 2>/dev/null | python3 -c \
+            "import sys,json
+          try:
+            data=json.load(sys.stdin)
+            alerts=data.get('site',[{}])[0].get('alerts',[])
+            print(sum(1 for a in alerts if a.get('riskcode') in ['3','4']))
+          except: print(0)" || echo "0")
+          echo "frontend_high=${FRONTEND_HIGH}" >> $GITHUB_OUTPUT
+
+          API_HIGH=$(cat zap-reports/zap-api-full.json 2>/dev/null | python3 -c \
+            "import sys,json
+          try:
+            data=json.load(sys.stdin)
+            alerts=data.get('site',[{}])[0].get('alerts',[])
+            print(sum(1 for a in alerts if a.get('riskcode') in ['3','4']))
+          except: print(0)" || echo "0")
+          echo "api_high=${API_HIGH}" >> $GITHUB_OUTPUT
+
+      - name: Alert on DAST findings
+        if: >
+          steps.zap_analysis.outputs.frontend_high != '0' ||
+          steps.zap_analysis.outputs.api_high != '0'
+        run: |
+          curl -X POST "${{ env.SLACK_WEBHOOK }}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🌐 *DAST Alert — Production OWASP ZAP Scan*\n• Frontend High/Critical findings: \`${{ steps.zap_analysis.outputs.frontend_high }}\`\n• API High/Critical findings: \`${{ steps.zap_analysis.outputs.api_high }}\`\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n@security-team please review ASAP!\"
+            }"
+
+      - name: Upload ZAP reports to Nexus
+        run: |
+          REPORT_DATE=$(date +%Y%m%d)
+          for f in zap-reports/*.json; do
+            curl --fail --silent --show-error \
+              --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+              --upload-file "${f}" \
+              "${{ secrets.NEXUS_URL }}/repository/ecommerce-security-reports/${REPORT_DATE}/$(basename ${f})" || true
+          done
+
+      - name: Upload ZAP reports as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scheduled-reports
+          path: zap-reports/
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 7. Security Summary — Aggregate & post daily digest
+  # ─────────────────────────────────────────────────────────────────────────────
+  security-summary:
+    name: Security Summary Report
+    runs-on: self-hosted
+    needs:
+      - secret-scanning
+      - sast-sonarqube
+      - sca-scan
+      - container-scan
+      - iac-security
+      - dast-production
+    if: always() && github.event_name == 'schedule'
+
+    steps:
+      - name: Post daily security digest to Slack
+        run: |
+          SECRET_STATUS="${{ needs.secret-scanning.result }}"
+          SAST_STATUS="${{ needs.sast-sonarqube.result }}"
+          SCA_STATUS="${{ needs.sca-scan.result }}"
+          CONTAINER_STATUS="${{ needs.container-scan.result }}"
+          IAC_STATUS="${{ needs.iac-security.result }}"
+          DAST_STATUS="${{ needs.dast-production.result }}"
+
+          status_emoji() {
+            [ "$1" = "success" ] && echo "✅" || echo "❌"
+          }
+
+          curl -X POST "${{ env.SLACK_WEBHOOK }}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"📊 *Daily Security Scan Summary — $(date +%Y-%m-%d)*\n\n$(status_emoji $SECRET_STATUS) Secret Scanning: \`${SECRET_STATUS}\`\n$(status_emoji $SAST_STATUS) SAST (SonarQube): \`${SAST_STATUS}\`\n$(status_emoji $SCA_STATUS) SCA (Dependencies): \`${SCA_STATUS}\`\n$(status_emoji $CONTAINER_STATUS) Container Scan (Trivy): \`${CONTAINER_STATUS}\`\n$(status_emoji $IAC_STATUS) IaC Scan (Checkov): \`${IAC_STATUS}\`\n$(status_emoji $DAST_STATUS) DAST (ZAP): \`${DAST_STATUS}\`\n\nFull details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }"

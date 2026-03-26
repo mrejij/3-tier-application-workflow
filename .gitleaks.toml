@@ -1,0 +1,51 @@
+# Gitleaks configuration for the ECommerce repository
+# https://github.com/zricethezav/gitleaks
+
+title = "ECommerce Gitleaks Config"
+
+[extend]
+# Extend from the default ruleset
+useDefault = true
+
+[[rules]]
+id = "azure-subscription-key"
+description = "Azure Subscription Key"
+regex = '''(?i)(azure[_\-\s]?subscription[_\-\s]?key|azure[_\-\s]?api[_\-\s]?key)\s*[=:]\s*['\"]?([0-9a-f]{32})['\"]?'''
+tags = ["azure", "api-key"]
+
+[[rules]]
+id = "azure-storage-account-key"
+description = "Azure Storage Account Key"
+regex = '''(?i)(DefaultEndpointsProtocol|AccountName|AccountKey)=(?:[^;]{3,})'''
+tags = ["azure", "storage"]
+
+[[rules]]
+id = "sonarqube-token"
+description = "SonarQube Token"
+regex = '''(?i)sonar[_\-\s]?token\s*[=:]\s*['\"]?([a-z0-9]{40})['\"]?'''
+tags = ["sonarqube"]
+
+# Allowlist — known false positives in this repo
+[allowlist]
+description = "Global allowlist"
+
+# Exclude test fixture files and migration scripts that contain example data
+paths = [
+  "database/migrations",
+  "docs/build-server-setup.md",
+  "docs/architecture.md",
+  ".github/workflows"
+]
+
+# Exclude placeholder values in config templates
+regexes = [
+  '''change-me-to-a-strong-secret-key-in-production''',
+  '''YOUR_NVD_API_KEY''',
+  '''YOUR_IP''',
+  '''YOUR_POSTGRES_HOST''',
+  '''YOUR_SONAR_DB_PASS''',
+  '''YOUR_ORG/YOUR_REPO''',
+  '''YOUR_RUNNER_TOKEN''',
+  '''\$\{secrets\.[A-Z_]+\}''',
+  '''\$\{\{.*secrets\..*\}\}'''
+]

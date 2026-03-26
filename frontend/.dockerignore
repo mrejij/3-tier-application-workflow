@@ -1,0 +1,12 @@
+# Angular build output
+dist/
+.angular/
+
+# Dependencies
+node_modules/
+
+# Environment files (use secrets instead)
+src/environments/environment.prod.ts
+
+# Test coverage
+coverage/
