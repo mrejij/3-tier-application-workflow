@@ -8,7 +8,7 @@ metadata:
     tier: frontend
     version: "latest"
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: frontend
@@ -25,24 +25,10 @@ spec:
       annotations:
         prometheus.io/scrape: "false"
     spec:
-      # Spread pods across nodes and AZs for HA
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: DoNotSchedule
-          labelSelector:
-            matchLabels:
-              app: frontend
-        - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: frontend
 
       containers:
         - name: frontend
-          image: REPLACE_WITH_ACR_NAME.azurecr.io/ecommerce-frontend:latest
+          image: acrecommercedevd9f4n2.azurecr.io/ecommerce-frontend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -92,11 +78,15 @@ spec:
               mountPath: /tmp
             - name: nginx-cache
               mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
 
       volumes:
         - name: tmp
           emptyDir: {}
         - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
           emptyDir: {}
 
       securityContext:

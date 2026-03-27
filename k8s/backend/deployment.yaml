@@ -7,7 +7,7 @@ metadata:
     app: backend
     tier: backend
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: backend
@@ -26,26 +26,10 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: DoNotSchedule
-          labelSelector:
-            matchLabels:
-              app: backend
-        - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: backend
-
-      # Use workload identity to access Azure Key Vault (no secret in cluster)
-      serviceAccountName: backend-workload-identity-sa
 
       containers:
         - name: backend
-          image: REPLACE_WITH_ACR_NAME.azurecr.io/ecommerce-backend:latest
+          image: acrecommercedevd9f4n2.azurecr.io/ecommerce-backend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -56,11 +40,6 @@ spec:
               value: "Production"
             - name: ASPNETCORE_URLS
               value: "http://+:8080"
-            - name: KeyVault__Uri
-              valueFrom:
-                configMapKeyRef:
-                  name: backend-config
-                  key: KEY_VAULT_URI
             - name: ApplicationInsights__ConnectionString
               valueFrom:
                 secretKeyRef:
@@ -127,4 +106,4 @@ spec:
       securityContext:
         fsGroup: 1001
 
-      automountServiceAccountToken: true   # needed for workload identity
+      automountServiceAccountToken: false

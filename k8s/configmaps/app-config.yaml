@@ -4,8 +4,8 @@ metadata:
   name: frontend-config
   namespace: ecommerce
 data:
-  # Replace with your Azure API management or backend domain
-  API_BASE_URL: "https://api.shopmart.example.com/api"
+  # Port-forwarded backend: kubectl port-forward svc/backend-svc 8081:80 -n ecommerce
+  API_BASE_URL: "http://localhost:8081/api"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -13,8 +13,7 @@ metadata:
   name: backend-config
   namespace: ecommerce
 data:
-  KEY_VAULT_URI: "https://shopmart-kv-prod.vault.azure.net/"   # Replace with your Key Vault URI
-  FRONTEND_URL:  "https://shopmart.example.com"                # Replace with your frontend domain
+  FRONTEND_URL:  "http://localhost:8080"
   Jwt__Issuer:   "shopmart-api"
   Jwt__Audience: "shopmart-clients"
   Pagination__DefaultPageSize: "12"
