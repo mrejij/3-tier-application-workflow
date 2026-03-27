@@ -91,7 +91,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   sast-sonarqube:
     name: SAST — SonarQube Full Scan
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scan_type == 'all' ||
@@ -128,23 +128,25 @@ jobs:
           dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
 
       - name: Scan Frontend (Angular)
-        run: |
-          cd frontend
-          npm ci --no-audit --silent
-          sonar-scanner \
-            -Dsonar.projectKey=ecommerce-frontend \
-            -Dsonar.projectName="ECommerce Frontend — Scheduled" \
-            -Dsonar.sources=src \
-            -Dsonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
-            -Dsonar.token="${{ secrets.SONAR_TOKEN }}" \
-            -Dsonar.qualitygate.wait=true || true
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: frontend
+          args: >
+            -Dsonar.projectKey=ecommerce-frontend
+            -Dsonar.projectName="ECommerce Frontend — Scheduled"
+            -Dsonar.sources=src
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
+            -Dsonar.qualitygate.wait=true
 
   # ─────────────────────────────────────────────────────────────────────────────
   # 3. SCA — Dependency vulnerability scan (both frontend & backend)
   # ─────────────────────────────────────────────────────────────────────────────
   sca-scan:
     name: SCA — Dependency Vulnerability Scan
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scan_type == 'all' ||
@@ -154,10 +156,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js & .NET
-        run: |
-          node --version
-          dotnet --version
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
 
       - name: npm audit — Frontend
         id: npm_audit
@@ -181,20 +188,20 @@ jobs:
           echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
           echo "high=${HIGH}" >> $GITHUB_OUTPUT
 
-      - name: OWASP Dependency-Check — Full Scan
-        run: |
-          /opt/dependency-check/bin/dependency-check.sh \
-            --project "ecommerce-full" \
-            --scan . \
-            --exclude "**/node_modules/**" \
-            --exclude "**/dist/**" \
-            --exclude "**/.git/**" \
-            --format HTML \
-            --format JSON \
-            --format XML \
-            --out dependency-check-reports/ \
-            --nvdApiKey "${{ secrets.NVD_API_KEY }}" \
-            --failOnCVSS 9 \
+      - name: Run OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'ecommerce-full'
+          path: '.'
+          format: 'HTML'
+          args: >
+            --format JSON
+            --format XML
+            --exclude **/node_modules/**
+            --exclude **/dist/**
+            --exclude **/.git/**
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+            --failOnCVSS 9
             --enableRetired
 
       - name: Alert if critical vulnerabilities found
@@ -224,13 +231,21 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   container-scan:
     name: Container Image Scan (Trivy)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scan_type == 'all' ||
       github.event.inputs.scan_type == 'container'
 
     steps:
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+            gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
+            sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -q && sudo apt-get install -y trivy
+
       - name: Login to ACR
         run: |
           docker login \
@@ -303,7 +318,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   iac-security:
     name: IaC Security Scan (Checkov)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scan_type == 'all' ||
@@ -312,6 +327,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install Checkov
+        run: pip3 install checkov
 
       - name: Checkov — Kubernetes manifests
         id: checkov_k8s
@@ -382,7 +400,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   dast-production:
     name: DAST — OWASP ZAP Full Scan (Production)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scan_type == 'all' ||
@@ -452,16 +470,6 @@ jobs:
               \"text\": \"🌐 *DAST Alert — Production OWASP ZAP Scan*\n• Frontend High/Critical findings: \`${{ steps.zap_analysis.outputs.frontend_high }}\`\n• API High/Critical findings: \`${{ steps.zap_analysis.outputs.api_high }}\`\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n@security-team please review ASAP!\"
             }"
 
-      - name: Upload ZAP reports to Nexus
-        run: |
-          REPORT_DATE=$(date +%Y%m%d)
-          for f in zap-reports/*.json; do
-            curl --fail --silent --show-error \
-              --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-              --upload-file "${f}" \
-              "${{ secrets.NEXUS_URL }}/repository/ecommerce-security-reports/${REPORT_DATE}/$(basename ${f})" || true
-          done
-
       - name: Upload ZAP reports as artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -475,7 +483,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   security-summary:
     name: Security Summary Report
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs:
       - secret-scanning
       - sast-sonarqube

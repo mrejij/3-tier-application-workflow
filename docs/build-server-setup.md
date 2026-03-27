@@ -1,7 +1,33 @@
 # Build Server Setup Guide — Azure VM (GitHub Actions Self-Hosted Runner)
 
-This guide covers provisioning and configuring an Azure VM as a GitHub Actions
-self-hosted runner and installing all required third-party build tools.
+This guide covers provisioning and configuring an Azure VM as a **deployment-only**
+GitHub Actions self-hosted runner.
+
+## Runner Strategy — Hosted vs Self-Hosted
+
+The VM is a **Standard_D2ls_v5 (2 vCPU / 4 GB RAM)** free-trial instance.
+Running SonarQube + Nexus + full CI toolchain on it exhausts memory and causes
+latency. The workload is split as follows:
+
+| Job type | Runner | Why |
+|---|---|---|
+| Build (.NET, Angular) | `ubuntu-latest` (hosted) | CPU-intensive; hosted runners are free and ephemeral |
+| Unit tests | `ubuntu-latest` (hosted) | Same |
+| Lint / format checks | `ubuntu-latest` (hosted) | Same |
+| Trivy container scan | `ubuntu-latest` (hosted) | Reaches public ACR endpoint directly |
+| Gitleaks secret scan | `ubuntu-latest` (hosted) | No VNet access needed |
+| Checkov IaC scan | `ubuntu-latest` (hosted) | No VNet access needed |
+| SonarQube analysis | `ubuntu-latest` (hosted) | Connects to SonarCloud (cloud-hosted) |
+| OWASP Dependency-Check | `ubuntu-latest` (hosted) | **Scheduled pipelines only** (daily/weekly) — NVD DB does not change per-PR |
+| Docker build + ACR push | `ubuntu-latest` (hosted) | ACR has a public endpoint |
+| Deploy to AKS | **self-hosted** (this VM) | Needs private VNet access to AKS API server |
+| Helm release | **self-hosted** (this VM) | Same |
+| `az aks get-credentials` | **self-hosted** (this VM) | Uses VM managed identity |
+
+The self-hosted runner installs **only**: Docker Engine, kubectl, Helm, Azure CLI.
+All other tools are installed on-demand by hosted runner job steps.
+
+---
 
 > **Infrastructure provisioned by Terraform.**
 > All Azure resources — VM, VNet, AKS, ACR, SQL, Key Vault, and Azure Bastion —
@@ -66,10 +92,13 @@ After apply, Terraform prints all outputs — ACR login server, AKS cluster
 name, VM name, SQL FQDN, Bastion name, and Key Vault URI.
 
 > **Note:** The VM runs a `cloud-init` script on first boot that installs
-> Docker, .NET 8 SDK, Node.js 20, kubectl, Helm, Azure CLI, Trivy, Gitleaks,
-> OWASP Dependency-Check, Checkov, SonarQube (Docker), and Nexus (Docker).
-> First-boot provisioning takes approximately 10–15 minutes.
+> **Docker Engine, kubectl, Helm, and Azure CLI only**.
+> First-boot provisioning takes approximately 5 minutes.
 > Monitor progress: `sudo tail -f /var/log/cloud-init-output.log`
+>
+> Tools NOT installed on this VM (run on GitHub Actions hosted runners): .NET SDK,
+> Node.js, Angular CLI, Trivy, Gitleaks, OWASP Dependency-Check, Checkov,
+> SonarQube, Nexus, dotnet-sonarscanner.
 
 ### 0c. Connect to the VM via Azure Bastion
 
@@ -99,38 +128,22 @@ There is no public IP — direct SSH is not available.
 Check whether cloud-init has finished installing tools:
 
 ```bash
-# Cloud-init log (follow until 'Build VM setup complete' appears)
+# Cloud-init log (follow until 'Build VM setup complete (deployment-only runner)' appears)
 sudo tail -f /var/log/cloud-init-output.log
 
-# Confirm build tools are present
+# Confirm deployment tools are present
 docker --version
-dotnet --version
-node --version
 kubectl version --client
-trivy --version
-gitleaks version
+helm version
+az --version
 ```
 
 If cloud-init is still in progress, wait for it to complete before proceeding.
 The steps below cover any additional manual configuration needed after first boot.
 
-Run the following setup commands:
-
-```bash
-# Update OS
-sudo apt-get update && sudo apt-get upgrade -y
-
-# Install any additional packages not covered by cloud-init
-sudo apt-get install -y \
-  curl wget git unzip zip jq \
-  apt-transport-https ca-certificates \
-  gnupg lsb-release software-properties-common \
-  python3 python3-pip build-essential
-```
-
 > **No data disk needed.** The Terraform module provisions a 64 GB OS disk
-> (Standard LRS). SonarQube and Nexus data directories are placed under
-> `/opt/sonarqube` and `/opt/nexus-data` respectively by cloud-init.
+> (Standard LRS). The disk is now ample — no SonarQube or Nexus data directories
+> are written by cloud-init.
 
 ---
 
@@ -166,47 +179,34 @@ sudo systemctl restart docker
 
 ---
 
-## 4. .NET 8 SDK
+## 4. .NET 8 SDK — Hosted Runner Only
 
-> **Installed automatically by cloud-init.** Verify:
+> **Not installed on this VM.** .NET builds, tests, and SonarScanner analysis
+> run on GitHub Actions **hosted runners** (`ubuntu-latest`).
 
-```bash
-dotnet --version   # Expected: 8.0.x
+In your GitHub Actions workflow, use the standard setup action:
 
-# dotnet-sonarscanner global tool (also installed by cloud-init)
-export PATH="$PATH:$HOME/.dotnet/tools"
-dotnet sonarscanner --version
-```
-
-If for any reason it is missing, install manually:
-
-```bash
-wget https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -O /tmp/ms-prod.deb
-sudo dpkg -i /tmp/ms-prod.deb
-sudo apt-get update && sudo apt-get install -y dotnet-sdk-8.0
-dotnet tool install --global dotnet-sonarscanner
-echo 'export PATH="$PATH:$HOME/.dotnet/tools"' >> ~/.bashrc
-source ~/.bashrc
+```yaml
+- uses: actions/setup-dotnet@v4
+  with:
+    dotnet-version: '8.0.x'
 ```
 
 ---
 
-## 5. Node.js 20 LTS
+## 5. Node.js 20 LTS — Hosted Runner Only
 
-> **Installed automatically by cloud-init**, including `@angular/cli` and `sonar-scanner`. Verify:
+> **Not installed on this VM.** Angular builds, `npm install`, and lint steps
+> run on GitHub Actions **hosted runners** (`ubuntu-latest`).
 
-```bash
-node --version   # Expected: v20.x.x
-npm --version
-ng version
-```
+In your GitHub Actions workflow:
 
-If missing, install manually:
-
-```bash
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
-npm install -g @angular/cli sonar-scanner
+```yaml
+- uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: 'npm'
+    cache-dependency-path: frontend/package-lock.json
 ```
 
 ---
@@ -271,212 +271,113 @@ use the **service principal** created in [Step 16](#16-azure-service-principal-f
 
 ---
 
-## 8. Trivy (Container & Filesystem Scanner)
+## 8. Trivy — Hosted Runner Only
 
-> **Installed automatically by cloud-init.** Verify:
+> **Not installed on this VM.** Trivy container and filesystem scans run on
+> GitHub Actions **hosted runners** using the official action:
 
-```bash
-trivy --version
-
-# Pre-populate the vulnerability database (saves time in CI)
-trivy image --download-db-only
+```yaml
+- uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: ${{ env.IMAGE_TAG }}
+    format: 'sarif'
+    output: 'trivy-results.sarif'
 ```
 
-If missing, install manually:
+ACR has a public endpoint so hosted runners can scan images directly.
 
-```bash
-wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
-  gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
-  sudo tee /etc/apt/sources.list.d/trivy.list
-sudo apt-get update && sudo apt-get install -y trivy
+---
+
+## 9. Gitleaks — Hosted Runner Only
+
+> **Not installed on this VM.** Secret scanning runs on GitHub Actions
+> **hosted runners**:
+
+```yaml
+- uses: gitleaks/gitleaks-action@v2
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 ---
 
-## 9. Gitleaks (Secret Scanner)
+## 10. OWASP Dependency-Check — Hosted Runner, Scheduled Only
 
-> **Installed automatically by cloud-init** (v8.18.4). Verify:
+> **Not installed on this VM.** Dependency-Check runs on GitHub Actions
+> **hosted runners** and is pinned to **scheduled pipelines only** (see below).
+> Running it on every PR is wasteful — the NVD database does not change
+> minute-to-minute and the Java process blocks 2 vCPUs for 10–20 minutes.
 
-```bash
-gitleaks version
-```
+In your GitHub Actions workflow, gate this job on a schedule:
 
-If missing, install manually:
+```yaml
+on:
+  schedule:
+    - cron: '0 2 * * 1'   # Every Monday at 02:00 UTC
+  workflow_dispatch:       # Allow manual trigger
 
-```bash
-GITLEAKS_VERSION="8.18.4"
-curl -sSfL \
-  "https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-  -o /tmp/gitleaks.tar.gz
-tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-sudo mv /tmp/gitleaks /usr/local/bin/ && sudo chmod +x /usr/local/bin/gitleaks
-```
-
----
-
-## 10. OWASP Dependency-Check
-
-> **Installed automatically by cloud-init** (v10.0.3 at `/opt/dependency-check`). Verify:
-
-```bash
-source /etc/profile.d/depcheck.sh
-dependency-check.sh --version
-```
-
-Pre-populate the NVD database (takes ~30 minutes, requires an API key):
-
-```bash
-# Get a free API key from https://nvd.nist.gov/developers/request-an-api-key
-dependency-check.sh --updateonly --nvdApiKey YOUR_NVD_API_KEY
-```
-
-If missing, install manually:
-
-```bash
-DEPCHECK_VERSION="10.0.3"
-sudo mkdir -p /opt/dependency-check
-curl -sSfL \
-  "https://github.com/jeremylong/DependencyCheck/releases/download/v${DEPCHECK_VERSION}/dependency-check-${DEPCHECK_VERSION}-release.zip" \
-  -o /tmp/dependency-check.zip
-sudo unzip -q /tmp/dependency-check.zip -d /opt/
-sudo chmod +x /opt/dependency-check/bin/dependency-check.sh
-echo 'export PATH="$PATH:/opt/dependency-check/bin"' | sudo tee /etc/profile.d/depcheck.sh
-source /etc/profile.d/depcheck.sh
+jobs:
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'ecommerce'
+          path: '.'
+          format: 'HTML'
+          args: --nvdApiKey ${{ secrets.NVD_API_KEY }}
 ```
 
 ---
 
-## 11. Checkov (IaC Security Scanner)
+## 11. Checkov — Hosted Runner Only
 
-> **Installed automatically by cloud-init** via `pip3 install checkov`. Verify:
+> **Not installed on this VM.** IaC security scanning runs on GitHub Actions
+> **hosted runners**:
 
-```bash
-checkov --version
+```yaml
+- uses: bridgecrewio/checkov-action@master
+  with:
+    directory: terraform/
+    framework: terraform
 ```
-
-If missing: `pip3 install checkov`
 
 ---
 
-## 12. SonarQube (Server — Docker)
+## 12. SonarQube Analysis — Hosted Runner / SonarCloud
 
-> **Started automatically by cloud-init** as a Docker container. Verify:
+> **SonarQube server is NOT hosted on this VM.** Use **SonarCloud** (free for
+> public repos, no self-hosted server required) so that GitHub-hosted runners
+> can reach it directly without VNet access.
+>
+> 1. Create a project at [sonarcloud.io](https://sonarcloud.io)
+> 2. Generate a token → save as GitHub Secret `SONAR_TOKEN`
+> 3. Set `SONAR_HOST_URL` to `https://sonarcloud.io`
 
-```bash
-docker ps --filter name=sonarqube
-docker logs sonarqube --tail 30
-```
+Remove `SONAR_HOST_URL` GitHub Secret pointing to the old VM IP and replace:
 
-SonarQube is available at `http://<VM_PRIVATE_IP>:9000` (accessible within the VNet).
-Default credentials: `admin` / `admin` — **change immediately**.
-
-Data is persisted to `/opt/sonarqube/` on the VM OS disk.
-
-If the container is not running, start it manually:
-
-```bash
-sudo mkdir -p /opt/sonarqube/{data,logs,extensions}
-sudo chown -R 1000:1000 /opt/sonarqube
-echo 'vm.max_map_count=524288' | sudo tee -a /etc/sysctl.conf
-sudo sysctl -w vm.max_map_count=524288
-
-docker run -d \
-  --name sonarqube \
-  --restart unless-stopped \
-  -p 9000:9000 \
-  -v /opt/sonarqube/data:/opt/sonarqube/data \
-  -v /opt/sonarqube/logs:/opt/sonarqube/logs \
-  -v /opt/sonarqube/extensions:/opt/sonarqube/extensions \
-  sonarqube:10-community
-```
-
-> **Accessing SonarQube UI from your local machine:**
-> Use Azure Bastion SSH tunnel, or set up an SSH port-forward via your
-> local machine if you have a tunnel to the VM's private IP.
-
-### Post-Install SonarQube Configuration
-
-```bash
-# Wait for SonarQube to start (check logs)
-docker logs -f sonarqube
-```
-
-Once running, configure via the UI at `http://<VM_PRIVATE_IP>:9000`:
-
-1. **Change admin password** (required on first login)
-2. **Create projects:**
-   - Project key: `ecommerce-frontend`
-   - Project key: `ecommerce-backend`
-3. **Generate a token:**
-   Administration → Security → Users → admin → Tokens → Generate
-   Save as GitHub Secret: `SONAR_TOKEN`
-4. **Quality Gate:** Sonar Way (default)
-
-> **NSG note:** Port 9000 is already allowed within the VNet (`snet-vm` 10.0.2.0/24)
-> by the Terraform NSG rule `AllowVnetInbound`. No manual NSG rule is needed.
+| Secret | Value |
+|---|---|
+| `SONAR_TOKEN` | Token from sonarcloud.io |
+| `SONAR_HOST_URL` | `https://sonarcloud.io` |
 
 ---
 
-## 13. Nexus Repository Manager (Docker)
+## 13. Nexus Repository — Replaced by GitHub Packages
 
-> **Started automatically by cloud-init** as a Docker container. Verify:
+> **Nexus is NOT hosted on this VM.** Use **GitHub Packages** (built into your
+> repository) as the artifact and Docker registry. This eliminates ~1–2 GB of
+> resident memory on the VM.
+>
+> - npm packages → `https://npm.pkg.github.com`
+> - NuGet packages → `https://nuget.pkg.github.com`
+> - Docker images → `ghcr.io/<org>/<repo>`
+>
+> Alternatively, keep pushing Docker images directly to **Azure Container
+> Registry** (ACR), which already has a public endpoint.
 
-```bash
-docker ps --filter name=nexus
-docker logs nexus --tail 30   # startup takes 2-3 minutes
-```
-
-Nexus is available at `http://<VM_PRIVATE_IP>:8081`.
-
-```bash
-# Retrieve the one-time initial admin password
-docker exec nexus cat /nexus-data/admin.password && echo
-```
-
-If the container is not running, start it manually:
-
-```bash
-sudo mkdir -p /opt/nexus-data
-sudo chown -R 200:200 /opt/nexus-data
-
-docker run -d \
-  --name nexus \
-  --restart unless-stopped \
-  -p 8081:8081 \
-  -v /opt/nexus-data:/nexus-data \
-  sonatype/nexus3:latest
-```
-
-> **NSG note:** Port 8081 is already allowed within the VNet by the Terraform
-> NSG rule `AllowVnetInbound` (ports 8080/8081/9000). No manual NSG rule is needed.
-
-### Nexus Repository Configuration
-
-After logging in to `http://<VM_IP>:8081`:
-
-1. **Change admin password** (prompted on first login)
-2. **Disable anonymous access** (Security > Anonymous Access > uncheck)
-3. **Create repositories:**
-
-```
-Repository Type     | Name                       | Format
---------------------|----------------------------|------------
-hosted (release)    | ecommerce-releases         | raw
-hosted (release)    | ecommerce-docker           | docker
-hosted (release)    | ecommerce-npm-hosted       | npm
-proxy               | ecommerce-npm-proxy        | npm (proxy → registry.npmjs.org)
-proxy               | ecommerce-nuget-proxy      | nuget (proxy → api.nuget.org)
-group               | ecommerce-npm-group        | npm (members: hosted + proxy)
-```
-
-4. **Create a CI user:**
-   - Security → Users → Create user
-   - Username: `ci-publisher`, password: strong secret
-   - Roles: `nx-repository-view-*-*-*`
-   - Save as GitHub Secrets: `NEXUS_USERNAME` / `NEXUS_PASSWORD`
-
-5. Port 8081 is already open within the VNet via the Terraform-managed NSG — no additional rule needed.
+Remove the `NEXUS_URL`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` GitHub Secrets.
 
 ---
 
@@ -578,7 +479,9 @@ az role assignment create \
 
 ## 17. Automated Maintenance (Cron Jobs)
 
-Set up scheduled maintenance on the build server:
+Set up scheduled maintenance on the build server (Docker cleanup only —
+Trivy and OWASP database updates now run on hosted runners via the scheduled
+pipeline):
 
 ```bash
 sudo crontab -e -u github-runner
@@ -589,12 +492,6 @@ Add these cron entries:
 ```cron
 # Prune unused Docker images/containers weekly (Sunday 01:00)
 0 1 * * 0 docker system prune -f --volumes
-
-# Update Trivy DB daily (03:00)
-0 3 * * * trivy image --download-db-only
-
-# Update OWASP Dependency-Check NVD database daily (04:00)
-0 4 * * * /opt/dependency-check/bin/dependency-check.sh --updateonly --nvdApiKey YOUR_NVD_API_KEY
 
 # Rotate runner work directory (keep last 48h)
 0 5 * * * find /opt/runner-work -maxdepth 1 -mtime +2 -exec rm -rf {} +
@@ -635,29 +532,128 @@ az vm extension set \
 
 ---
 
+## 19. Recreating the VM with the Updated Cloud-Init Script
+
+Because `custom_data` (cloud-init) on an Azure VM cannot be changed in-place—
+it only runs once at first boot—recreating the VM is the only way to apply a
+new cloud-init script.
+
+> **Before you start:** The runner will be offline during this procedure.
+> Make sure no CI jobs are running or queue them to another runner first.
+
+### Step 1 — Deregister the old runner from GitHub
+
+Connect via Azure Bastion (see [Step 0c](#0c-connect-to-the-vm-via-azure-bastion)),
+then:
+
+```bash
+sudo su - github-runner
+cd ~/actions-runner
+
+# Remove the runner registration from GitHub
+./config.sh remove --token YOUR_RUNNER_REMOVAL_TOKEN
+# Get the removal token from: GitHub → Settings → Actions → Runners → (runner) → Remove
+
+# Stop and disable the systemd service
+exit   # back to azureuser
+cd /home/github-runner/actions-runner
+sudo ./svc.sh stop
+sudo ./svc.sh uninstall github-runner
+```
+
+### Step 2 — Destroy only the VM (preserve AKS, ACR, SQL, Key Vault)
+
+From your local machine (where Terraform is initialised):
+
+```bash
+cd terraform
+
+# Target only the VM module resources to avoid touching AKS / SQL / ACR
+terraform destroy \
+  -target="module.build_vm.azurerm_linux_virtual_machine.main" \
+  -target="module.build_vm.azurerm_network_interface.main" \
+  -target="module.build_vm.azurerm_public_ip.vm" \
+  -var-file=terraform.tfvars
+```
+
+Confirm with `yes` when prompted. This deletes only:
+- The VM and its OS disk
+- The NIC
+- The public IP
+
+AKS, ACR, SQL, Key Vault, and the VNet are **not touched**.
+
+### Step 3 — Recreate the VM
+
+```bash
+# Apply only the build_vm module — Terraform regenerates the SSH key and
+# runs the new slim cloud-init on first boot
+terraform apply \
+  -target="module.build_vm" \
+  -var-file=terraform.tfvars
+```
+
+Terraform will create a new VM, NIC, and public IP and print the new private IP.
+
+### Step 4 — Wait for cloud-init to finish
+
+Connect via Azure Bastion to the new VM and monitor boot progress:
+
+```bash
+sudo tail -f /var/log/cloud-init-output.log
+# Wait for: "Build VM setup complete (deployment-only runner)"
+
+# Verify tools
+docker --version
+kubectl version --client
+helm version
+az --version
+```
+
+Cloud-init now takes approximately **5 minutes** (down from 10–15 minutes).
+
+### Step 5 — Register the runner
+
+Follow [Step 14](#14-register-github-actions-self-hosted-runner) to re-register
+the runner with GitHub using a fresh token.
+
+### Step 6 — Verify the runner is online
+
+```bash
+sudo ./svc.sh status
+```
+
+Then in GitHub: **Settings → Actions → Runners** — the runner should show
+as **Idle** (green).
+
+---
+
 ## Summary: Tool Version Reference
 
-All tools marked **cloud-init** are installed automatically on first VM boot
-by the `custom_data` script in `terraform/modules/build_vm/main.tf`.
+Tools on the **self-hosted runner VM** (installed by cloud-init):
 
-| Tool                     | Version   | Install Method  | Location                             |
-|--------------------------|-----------|-----------------|--------------------------------------|
-| Ubuntu                   | 22.04 LTS | Terraform image | OS                                   |
-| Docker Engine            | latest    | cloud-init      | `/usr/bin/docker`                    |
-| .NET SDK                 | 8.0       | cloud-init      | `/usr/bin/dotnet`                    |
-| dotnet-sonarscanner      | latest    | cloud-init      | `~/.dotnet/tools/`                   |
-| Node.js                  | 20 LTS    | cloud-init      | `/usr/bin/node`                      |
-| Angular CLI              | 17        | cloud-init      | npm global                           |
-| kubectl                  | stable    | cloud-init      | `/usr/local/bin/kubectl`             |
-| Helm                     | 3.x       | cloud-init      | `/usr/local/bin/helm`                |
-| Azure CLI                | latest    | cloud-init      | `/usr/bin/az`                        |
-| Trivy                    | latest    | cloud-init      | `/usr/bin/trivy`                     |
-| Gitleaks                 | 8.18.4    | cloud-init      | `/usr/local/bin/gitleaks`            |
-| OWASP Dependency-Check   | 10.0.3    | cloud-init      | `/opt/dependency-check/`             |
-| Checkov                  | latest    | cloud-init      | `/usr/local/bin/checkov`             |
-| SonarQube (server)       | 10.x      | cloud-init      | Docker container, port 9000          |
-| Nexus Repository         | latest    | cloud-init      | Docker container, port 8081          |
-| GitHub Actions Runner    | 2.316.x   | Manual (Step 14)| `/home/github-runner/actions-runner/`|
+| Tool                   | Version  | Install Method | Location                   |
+|------------------------|----------|----------------|----------------------------|
+| Ubuntu                 | 22.04 LTS| Terraform image| OS                         |
+| Docker Engine          | latest   | cloud-init     | `/usr/bin/docker`          |
+| kubectl                | stable   | cloud-init     | `/usr/local/bin/kubectl`   |
+| Helm                   | 3.x      | cloud-init     | `/usr/local/bin/helm`      |
+| Azure CLI              | latest   | cloud-init     | `/usr/bin/az`              |
+| GitHub Actions Runner  | 2.316.x  | Manual (Step 14)| `/home/github-runner/actions-runner/` |
+
+Tools on **GitHub Actions hosted runners** (`ubuntu-latest`):
+
+| Tool                   | Version  | How it arrives                            |
+|------------------------|----------|-------------------------------------------|
+| .NET SDK               | 8.0      | `actions/setup-dotnet@v4`                 |
+| dotnet-sonarscanner    | latest   | `dotnet tool install` step in workflow    |
+| Node.js                | 20 LTS   | `actions/setup-node@v4`                   |
+| Angular CLI            | 17       | `npm install -g @angular/cli` step        |
+| Trivy                  | latest   | `aquasecurity/trivy-action`               |
+| Gitleaks               | latest   | `gitleaks/gitleaks-action@v2`             |
+| Checkov                | latest   | `bridgecrewio/checkov-action`             |
+| OWASP Dependency-Check | 10.x     | `dependency-check/Dependency-Check_Action` (scheduled only) |
+| SonarQube analysis     | latest   | `sonarsource/sonarqube-scan-action` via SonarCloud |
 
 ---
 

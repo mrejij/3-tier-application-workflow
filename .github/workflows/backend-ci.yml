@@ -1,4 +1,4 @@
-name: Backend CI — Build, Scan & Publish to Nexus
+name: Backend CI — Build, Scan & Deploy
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   secret-scan:
     name: Secret Scanning (Gitleaks)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,26 +31,16 @@ jobs:
           fetch-depth: 0
 
       - name: Run Gitleaks
-        run: |
-          gitleaks detect \
-            --source . \
-            --report-format sarif \
-            --report-path gitleaks-report.sarif \
-            --exit-code 1
-
-      - name: Upload Gitleaks SARIF
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gitleaks-sarif-backend
-          path: gitleaks-report.sarif
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 2: Build & Unit Tests
   # ─────────────────────────────────────────────────────────────────────────────
   build-test:
     name: .NET Build & Unit Tests
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: secret-scan
 
     steps:
@@ -128,7 +118,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   sonarqube:
     name: SonarQube SAST Analysis
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: build-test
 
     steps:
@@ -182,7 +172,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   owasp-dependency-check:
     name: OWASP Dependency-Check
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: build-test
 
     steps:
@@ -190,29 +180,30 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run OWASP Dependency-Check
-        run: |
-          /opt/dependency-check/bin/dependency-check.sh \
-            --project "ecommerce-backend" \
-            --scan backend/ \
-            --format HTML \
-            --format JSON \
-            --out dependency-check-reports/ \
-            --failOnCVSS 8 \
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'ecommerce-backend'
+          path: 'backend/'
+          format: 'HTML'
+          args: >
+            --format JSON
+            --failOnCVSS 8
             --enableRetired
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
 
       - name: Upload Dependency-Check report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: owasp-dependency-check-backend
-          path: dependency-check-reports/
+          path: ${{ github.workspace }}/reports
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 5: Docker Build & Trivy Container Scan
   # ─────────────────────────────────────────────────────────────────────────────
   docker-build-scan:
     name: Docker Build & Trivy Container Scan
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: [sonarqube, owasp-dependency-check]
 
     steps:
@@ -239,23 +230,25 @@ jobs:
             backend/
 
       - name: Run Trivy filesystem scan
-        run: |
-          trivy fs \
-            --exit-code 0 \
-            --severity HIGH,CRITICAL \
-            --format sarif \
-            --output trivy-fs-backend.sarif \
-            backend/
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'backend/'
+          exit-code: '0'
+          severity: 'HIGH,CRITICAL'
+          format: 'sarif'
+          output: 'trivy-fs-backend.sarif'
 
       - name: Run Trivy image scan
-        run: |
-          trivy image \
-            --exit-code 1 \
-            --severity CRITICAL \
-            --ignore-unfixed \
-            --format sarif \
-            --output trivy-image-backend.sarif \
-            ${{ steps.tags.outputs.image_tag }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: '${{ steps.tags.outputs.image_tag }}'
+          exit-code: '1'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-image-backend.sarif'
 
       - name: Upload Trivy reports
         if: always()
@@ -292,63 +285,28 @@ jobs:
           path: image-metadata.env
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 6: Publish Artifact to Nexus
+  # JOB 6: Notify
+  # Docker image is already pushed to ACR in the docker-build-scan job.
+  # Build artifact is already uploaded as a GitHub Actions artifact.
   # ─────────────────────────────────────────────────────────────────────────────
-  publish-nexus:
-    name: Publish Build Artifact to Nexus
-    runs-on: self-hosted
+  notify:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
     needs: docker-build-scan
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download publish artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: backend-publish
-          path: publish/
-
-      - name: Package artifact
-        run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
-          VERSION="1.0.0-${SHORT_SHA}"
-          tar -czf "ecommerce-backend-${VERSION}.tar.gz" -C publish .
-          echo "ARTIFACT_VERSION=${VERSION}" >> $GITHUB_ENV
-          echo "ARTIFACT_FILE=ecommerce-backend-${VERSION}.tar.gz" >> $GITHUB_ENV
-
-      - name: Upload .NET build to Nexus Raw Repository
-        run: |
-          curl --fail --silent --show-error \
-            --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            --upload-file "${{ env.ARTIFACT_FILE }}" \
-            "${{ secrets.NEXUS_URL }}/repository/ecommerce-releases/backend/${{ env.ARTIFACT_VERSION }}/${{ env.ARTIFACT_FILE }}"
-
-      - name: Upload Docker image digest to Nexus
-        run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
-          docker inspect "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}" \
-            --format '{{json .}}' > docker-manifest.json
-          curl --fail --silent --show-error \
-            --user "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            --upload-file docker-manifest.json \
-            "${{ secrets.NEXUS_URL }}/repository/ecommerce-releases/backend/${{ env.ARTIFACT_VERSION }}/docker-manifest.json"
-
       - name: Notify Slack — Build Success
-        if: success()
+        if: needs.docker-build-scan.result == 'success'
         run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
           curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
             -H 'Content-type: application/json' \
-            --data '{
-              "text": "✅ *Backend CI Passed* — `${{ github.ref_name }}` @ `'"$(echo ${{ github.sha }} | cut -c1-8)"'`\nArtifact: `${{ env.ARTIFACT_FILE }}` published to Nexus"
-            }'
+            --data "{\"text\": \"✅ *Backend CI Passed* — \`${{ github.ref_name }}\` @ \`${SHORT_SHA}\`\\nImage pushed to ACR: \`${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}\`\"}"
 
       - name: Notify Slack — Build Failure
-        if: failure()
+        if: needs.docker-build-scan.result != 'success'
         run: |
           curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
             -H 'Content-type: application/json' \
-            --data '{
-              "text": "❌ *Backend CI FAILED* — `${{ github.ref_name }}` @ `'"$(echo ${{ github.sha }} | cut -c1-8)"'`\nCheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }'
+            --data "{\"text\": \"❌ *Backend CI FAILED* — \`${{ github.ref_name }}\` @ \`$(echo ${{ github.sha }} | cut -c1-8)\`\\nCheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
