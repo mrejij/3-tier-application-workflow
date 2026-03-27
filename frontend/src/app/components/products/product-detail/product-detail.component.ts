@@ -67,11 +67,11 @@ import { Product } from '../../../models/product.model';
               <div class="d-flex align-items-center gap-3 mt-3">
                 <div class="input-group" style="width:120px;">
                   <button class="btn btn-outline-secondary" type="button"
-                          (click)="quantity > 1 && quantity--">-</button>
+                          (click)="quantity = quantity > 1 ? quantity - 1 : quantity">-</button>
                   <input type="number" class="form-control text-center" [(ngModel)]="quantity"
                          min="1" [max]="product()!.stockQuantity" />
                   <button class="btn btn-outline-secondary" type="button"
-                          (click)="quantity < product()!.stockQuantity && quantity++">+</button>
+                          (click)="quantity = quantity < product()!.stockQuantity ? quantity + 1 : quantity">+</button>
                 </div>
                 <button class="btn btn-primary px-4" (click)="addToCart()">
                   <i class="bi bi-cart-plus me-2"></i>Add to Cart
