@@ -1,5 +1,5 @@
 ﻿name: Backend CI — Build & Push to ACR
-
+# This workflow builds the .NET backend, creates a Docker image, and pushes it to Azure Container Registry (ACR).
 on:
   push:
     branches: [main, develop]
